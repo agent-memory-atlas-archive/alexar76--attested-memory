@@ -155,6 +155,10 @@ def protocol_manifest() -> dict:
 
 
 _BUYER_REF = re.compile(r"bref-[0-9a-f]{32}")
+_NEEDS_BUYER = (
+    "memory.attest@v1 needs a buyer the hub can name: call it with an X-API-Key credit account "
+    "(or a verified payment); trial and anonymous calls can read lineage and verify receipts only"
+)
 
 
 def _aimarket_actor(request: Request) -> str:
@@ -181,7 +185,12 @@ def invoke_capability(
         raise HTTPException(status_code=422, detail="input must be an object")
     try:
         if capability_id == "memory.attest@v1":
-            attestation = AttestationCreate.model_validate({**payload, "actor_id": _aimarket_actor(request)})
+            actor = _aimarket_actor(request)
+            # A receipt says who attested what; one in the name of nobody is an unaccountable write.
+            # Memory Market refuses anonymous writes the same way (_NEEDS_BUYER); reads stay open.
+            if actor == "aimarket:anonymous":
+                raise HTTPException(status_code=403, detail=_NEEDS_BUYER)
+            attestation = AttestationCreate.model_validate({**payload, "actor_id": actor})
             result = ledger().append(attestation).model_dump(mode="json")
         elif capability_id == "lineage.get@v1":
             result = ledger().lineage(str(payload.get("memory_id") or "")).model_dump(mode="json")

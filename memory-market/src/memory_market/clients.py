@@ -37,6 +37,27 @@ class TrustClients:
         except httpx.HTTPError:
             return None
 
+    def created_receipt(self, unit: MemoryUnit) -> dict | None:
+        """The ledger's ``created`` receipt for this unit's content, if one exists: an earlier attest
+        may have reached the ledger while its answer never reached us. None also when the ledger is
+        unreachable."""
+        if not self.settings.provenance_url:
+            return None
+        try:
+            response = httpx.get(
+                f"{self.settings.provenance_url.rstrip('/')}/v1/lineage/{unit.id}",
+                headers={"Authorization": f"Bearer {self.settings.provenance_token}"},
+                timeout=4,
+            )
+            response.raise_for_status()
+            receipts = response.json().get("receipts") or []
+        except (httpx.HTTPError, ValueError):
+            return None
+        for receipt in receipts:
+            if receipt.get("event_type") == "created" and receipt.get("content_hash") == unit.content_hash:
+                return receipt
+        return None
+
     def verify(self, unit: MemoryUnit, request: VerifyMemory) -> dict | None:
         if not self.settings.truth_url:
             return None

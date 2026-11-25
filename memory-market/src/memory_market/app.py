@@ -285,12 +285,37 @@ def stats(actor_id: str | None = Depends(optional_actor), settings: Settings = D
     return store().stats(actor_id, bool(settings.payment_recipient))
 
 
+_TRUTH_STATUSES = ("unverified", "supported", "contested", "rejected")
+
+
+def _truth_filter(value: object) -> tuple[str, ...] | None:
+    """``truth`` on a catalog or search: empty = the default (all but ``rejected``), ``any`` = no
+    filter, else a comma-separated list of Truth Layer statuses. An unknown status is a 422, not an
+    empty result that looks like "nothing matched"."""
+    from .store import DEFAULT_TRUTH
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return DEFAULT_TRUTH
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="truth must be a comma-separated string")
+    if value.strip().casefold() == "any":
+        return None
+    wanted = tuple(dict.fromkeys(part.strip().casefold() for part in value.split(",") if part.strip()))
+    unknown = [status for status in wanted if status not in _TRUTH_STATUSES]
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"unknown truth status {', '.join(unknown)}; "
+                                                    f"use {', '.join(_TRUTH_STATUSES)} or any")
+    return wanted
+
+
 @app.get("/v1/catalog", response_model=Catalog)
 def catalog(
     q: str = Query(default="", max_length=200), limit: int = Query(default=30, ge=1, le=100),
     offset: int = Query(default=0, ge=0), actor_id: str | None = Depends(optional_actor), team_id: str | None = Depends(team_context),
+    truth: str = Query(default="", max_length=80, description="Truth Layer statuses to include, comma-separated, "
+                       "or any; default: all but rejected"),
 ) -> Catalog:
-    items, total = store().catalog(q, actor_id, limit, offset, team_id)
+    items, total = store().catalog(q, actor_id, limit, offset, team_id, _truth_filter(truth))
     return Catalog(items=items, total=total, query=q)
 
 
@@ -524,6 +549,13 @@ def invoke_capability(product_id: str, capability_id: str, body: dict, request: 
         if capability_id == "memory.write@v1":
             allowed = {key: payload[key] for key in ("title", "content", "tags", "visibility", "price_usdc", "source_refs", "parent_memory_ids") if key in payload}
             unit = store().create(MemoryCreate.model_validate(allowed), actor)
+            # The REST write asks the ledger for a receipt; this one did not, so units written
+            # through the hub had no provenance at all. A ledger that is down leaves the unit
+            # unattested for python -m memory_market.reconcile_provenance to finish.
+            receipt = TrustClients(get_settings()).attest(unit, "created", actor)
+            if receipt:
+                store().set_provenance(unit.id, receipt["id"], receipt["chain_root"])
+                unit = store().get_unchecked(unit.id)
             result = unit.model_dump(mode="json")
         elif capability_id == "memory.read@v1":
             unit = store().get_unchecked(str(payload.get("memory_id") or ""))
@@ -532,7 +564,8 @@ def invoke_capability(product_id: str, capability_id: str, body: dict, request: 
             result = unit.model_dump(mode="json")
         elif capability_id == "memory.search@v1":
             limit = max(1, min(int(payload.get("limit", 20)), 100))
-            items, total = store().catalog(str(payload.get("query") or ""), actor, limit, 0)
+            items, total = store().catalog(str(payload.get("query") or ""), actor, limit, 0,
+                                           truth=_truth_filter(payload.get("truth")))
             result = {"items": [item.model_dump(mode="json") for item in items], "total": total}
         elif capability_id == "memory.share@v1":
             grant = store().grant(str(payload.get("memory_id") or ""), str(payload.get("grantee_id") or ""), actor)

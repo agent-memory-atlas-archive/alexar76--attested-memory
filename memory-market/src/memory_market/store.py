@@ -20,6 +20,11 @@ def content_hash(content: str) -> str:
     return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+
+# Truth Layer statuses a catalog or search offers unless the caller asks otherwise: everything but a
+# memory the evidence rejected. TruthStatus in models.py lists all four.
+DEFAULT_TRUTH: tuple[str, ...] = ("unverified", "supported", "contested")
+
 class MemoryStore:
     def __init__(self, db_path: str):
         import os
@@ -322,7 +327,11 @@ class MemoryStore:
             return False
         return actor_id == unit.owner_id or self.has_grant(unit.id, actor_id)
 
-    def catalog(self, query: str, actor_id: str | None, limit: int, offset: int, team_id: str | None = None) -> tuple[list[MemorySummary], int]:
+    def catalog(self, query: str, actor_id: str | None, limit: int, offset: int, team_id: str | None = None,
+                truth: tuple[str, ...] | None = DEFAULT_TRUTH) -> tuple[list[MemorySummary], int]:
+        """Discoverable memories, newest first. ``truth`` keeps only those whose Truth Layer status is
+        listed; by default a memory the evidence rejected is not offered as an answer (it can still be
+        read by id, with its status). ``None`` applies no truth filter."""
         params: list[object] = []
         access = "(visibility IN ('public','paid'))"
         team_tag = None
@@ -351,6 +360,9 @@ class MemoryStore:
             search = f" AND (lower(title) LIKE ? OR lower(tags) LIKE ? OR (lower(content) LIKE ? AND ({readable})))"
             params.extend([needle, needle, needle])
             params.extend(content_params)
+        if truth is not None:
+            search += (" AND truth_status IN (" + ",".join("?" * len(truth)) + ")") if truth else " AND 1=0"
+            params.extend(truth)
         count = self.connection.execute(f"SELECT COUNT(*) count FROM memories WHERE {access}{search}", params).fetchone()["count"]
         rows = self.connection.execute(
             f"SELECT * FROM memories WHERE {access}{search} ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -396,6 +408,14 @@ class MemoryStore:
                 "UPDATE memories SET provenance_status='attested', receipt_id=?, lineage_root=?, updated_at=? WHERE id=?",
                 (receipt_id, lineage_root, now(), memory_id),
             )
+
+    def unattested(self, limit: int = 200, after_id: str = "") -> list[MemoryUnit]:
+        """Units the ledger never confirmed (``provenance_status='unattested'``), oldest id first."""
+        rows = self.connection.execute(
+            "SELECT * FROM memories WHERE provenance_status='unattested' AND id > ? ORDER BY id LIMIT ?",
+            (after_id, limit),
+        ).fetchall()
+        return [self._unit(row) for row in rows]
 
     def set_truth(self, memory_id: str, status: str, confidence: float, pack_id: str) -> None:
         with self.connection:

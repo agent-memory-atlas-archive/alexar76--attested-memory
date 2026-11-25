@@ -128,3 +128,103 @@ def test_hub_attestation_actor_is_the_named_buyer_or_plainly_anonymous():
     assert _aimarket_actor(req({"X-AIMarket-Buyer-Ref": ref})) == "aimarket:" + ref
     for headers in ({}, {"X-Payment-Channel": ""}, {"X-AIMarket-Buyer-Ref": "bref-zz"}):
         assert _aimarket_actor(req(headers)) == "aimarket:anonymous"
+
+
+def _rewrite_and_resign(ledger, receipt, attacker_key_path):
+    """What someone who can write the database can do: change a field, recompute both hashes
+    and sign the new root with a key of their own, which the row then carries."""
+    import json
+    from provenance_ledger.store import canonical_json, sha256
+
+    attacker = Signer(attacker_key_path)
+    event = {
+        "id": receipt.id, "memory_id": receipt.memory_id, "event_type": receipt.event_type,
+        "content_hash": receipt.content_hash, "actor_id": "attacker",
+        "source_refs": receipt.source_refs, "parent_memory_ids": receipt.parent_memory_ids,
+        "metadata": receipt.metadata, "created_at": receipt.created_at,
+    }
+    event_hash = sha256(canonical_json(event))
+    chain_root = sha256(receipt.previous_root + ":" + event_hash)
+    with ledger.connection:
+        ledger.connection.execute(
+            "UPDATE receipts SET actor_id='attacker', event_hash=?, chain_root=?, signature=?, public_key=? WHERE id=?",
+            (event_hash, chain_root, attacker.sign(chain_root), attacker.public_key, receipt.id),
+        )
+        ledger.connection.execute(
+            "UPDATE receipt_heads SET chain_root=? WHERE memory_id=?", (chain_root, receipt.memory_id))
+    assert json.dumps(event)  # the forged event is well-formed
+
+
+def test_a_row_re_signed_with_another_key_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.delenv("ATTESTED_PQC_ENABLED", raising=False)
+    ledger = Ledger(str(tmp_path / "ledger.sqlite3"), Signer(str(tmp_path / "key.pem")))
+    receipt = ledger.append(AttestationCreate(
+        memory_id="mem_1234567890abcdef12345678", event_type="created",
+        content_hash="sha256:" + "d" * 64, actor_id="agent:test",
+    ))
+    _rewrite_and_resign(ledger, receipt, str(tmp_path / "attacker.pem"))
+    result = ledger.verify(receipt.id)
+    # The hashes and the signature are internally consistent; only the key gives it away.
+    assert result.checks["event_hash"] and result.checks["chain_root"] and result.checks["signature"]
+    assert result.checks["signer_key"] is False
+    assert result.valid is False
+
+
+def test_an_earlier_key_listed_as_trusted_still_verifies(tmp_path, monkeypatch):
+    monkeypatch.delenv("ATTESTED_PQC_ENABLED", raising=False)
+    old = Signer(str(tmp_path / "old.pem"))
+    ledger = Ledger(str(tmp_path / "ledger.sqlite3"), old)
+    receipt = ledger.append(AttestationCreate(
+        memory_id="mem_1234567890abcdef12345678", event_type="created",
+        content_hash="sha256:" + "e" * 64, actor_id="agent:test",
+    ))
+    rotated = Ledger(str(tmp_path / "ledger.sqlite3"), Signer(str(tmp_path / "new.pem")))
+    assert rotated.verify(receipt.id).checks["signer_key"] is False
+    monkeypatch.setenv("PROVENANCE_TRUSTED_PUBLIC_KEYS", old.public_key)
+    assert rotated.verify(receipt.id).valid is True
+
+
+def test_deleting_the_newest_receipts_of_a_chain_is_detected(tmp_path, monkeypatch):
+    monkeypatch.delenv("ATTESTED_PQC_ENABLED", raising=False)
+    ledger = Ledger(str(tmp_path / "ledger.sqlite3"), Signer(str(tmp_path / "key.pem")))
+    memory_id = "mem_1234567890abcdef12345678"
+    first = ledger.append(AttestationCreate(
+        memory_id=memory_id, event_type="created", content_hash="sha256:" + "f" * 64, actor_id="agent:test"))
+    second = ledger.append(AttestationCreate(
+        memory_id=memory_id, event_type="verified", content_hash="sha256:" + "f" * 64, actor_id="truth-layer"))
+    assert ledger.verify(first.id).valid is True
+    with ledger.connection:
+        ledger.connection.execute("DELETE FROM receipts WHERE id = ?", (second.id,))
+    result = ledger.verify(first.id)
+    assert result.checks["previous_link"] is True and result.checks["signature"] is True
+    assert result.checks["chain_head"] is False
+    assert result.valid is False
+
+
+def test_hub_attest_refuses_an_anonymous_caller_but_reads_stay_open(tmp_path, monkeypatch):
+    """memory.attest@v1 appended for aimarket:anonymous, taking memory_id and content_hash from the
+    caller; Memory Market's capability route already refused anonymous writes."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("ATTESTED_PQC_ENABLED", raising=False)
+    test_ledger = Ledger(str(tmp_path / "ledger.sqlite3"), Signer(str(tmp_path / "key.pem")))
+    monkeypatch.setattr(app_module, "ledger", lambda: test_ledger)
+    client = TestClient(app_module.app)
+    body = {"input": {"memory_id": "mem_1234567890abcdef12345678", "event_type": "created",
+                      "content_hash": "sha256:" + "9" * 64}}
+    product = app_module.BY_CAPABILITY["memory.attest@v1"].product_id
+    url = f"/capabilities/{product}/memory.attest@v1/invoke"
+
+    refused = client.post(url, json=body)
+    assert refused.status_code == 403
+    assert test_ledger.lineage("mem_1234567890abcdef12345678").receipts == []
+
+    named = client.post(url, json=body, headers={"X-AIMarket-Buyer-Ref": "bref-" + "a" * 32})
+    assert named.status_code == 200, named.text
+    receipt = named.json()["result"]
+    assert receipt["actor_id"] == "aimarket:bref-" + "a" * 32
+
+    product_l = app_module.BY_CAPABILITY["lineage.get@v1"].product_id
+    lineage = client.post(f"/capabilities/{product_l}/lineage.get@v1/invoke",
+                          json={"input": {"memory_id": "mem_1234567890abcdef12345678"}})
+    assert lineage.status_code == 200 and len(lineage.json()["result"]["receipts"]) == 1

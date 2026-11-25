@@ -188,6 +188,20 @@ class Ledger:
         receipts = [self._receipt(row) for row in rows]
         return Lineage(memory_id=memory_id, chain_root=receipts[-1].chain_root if receipts else None, receipts=receipts)
 
+    def trusted_public_keys(self) -> set[str]:
+        """The ledger's Ed25519 key, plus earlier keys listed in PROVENANCE_TRUSTED_PUBLIC_KEYS
+        (comma-separated, as receipts carry them) so receipts signed before a key rotation verify."""
+        import os
+        extra = {k.strip() for k in os.getenv("PROVENANCE_TRUSTED_PUBLIC_KEYS", "").split(",") if k.strip()}
+        return {self.signer.public_key} | extra
+
+    def trusted_pq_public_keys(self) -> set[str]:
+        """The ledger's ML-DSA-65 key when PQC is on, plus PROVENANCE_TRUSTED_PQ_PUBLIC_KEYS."""
+        import os
+        extra = {k.strip() for k in os.getenv("PROVENANCE_TRUSTED_PQ_PUBLIC_KEYS", "").split(",") if k.strip()}
+        own = {self.signer.pq_public_key} if self.signer.pq_public_key else set()
+        return own | extra
+
     def verify(self, receipt_id: str) -> VerifyResult:
         row = self.connection.execute("SELECT * FROM receipts WHERE id = ?", (receipt_id,)).fetchone()
         if row is None:
@@ -214,8 +228,26 @@ class Ledger:
         ).fetchone()
         expected_previous = previous_row["chain_root"] if previous_row else GENESIS_ROOT
         link_ok = expected_previous == receipt.previous_root
+        # A signature is only evidence if it is the ledger's own: the row carries its public key, so
+        # checking against that key alone let anyone who can rewrite a row re-hash and re-sign it.
+        signer_ok = receipt.public_key in self.trusted_public_keys() and (
+            receipt.pq_public_key is None or receipt.pq_public_key in self.trusted_pq_public_keys()
+        )
+        # The newest stored receipt of the memory must be the chain head the ledger recorded, so
+        # deleting the latest receipts of a chain is not invisible. Both live in this database, so
+        # this catches lost or deleted rows, not an attacker who also rewrites receipt_heads; for
+        # that, compare with a chain_root kept outside the ledger (the one returned on append).
+        head = self.connection.execute(
+            "SELECT chain_root FROM receipt_heads WHERE memory_id = ?", (receipt.memory_id,)
+        ).fetchone()
+        last = self.connection.execute(
+            "SELECT chain_root FROM receipts WHERE memory_id = ? ORDER BY sequence DESC LIMIT 1",
+            (receipt.memory_id,),
+        ).fetchone()
+        head_ok = head is not None and last is not None and head["chain_root"] == last["chain_root"]
         checks = {
             "event_hash": event_ok, "chain_root": root_ok, "signature": signature_ok,
             "pq_signature": pq_signature_ok, "previous_link": link_ok,
+            "signer_key": signer_ok, "chain_head": head_ok,
         }
         return VerifyResult(receipt_id=receipt.id, valid=all(checks.values()), checks=checks)
