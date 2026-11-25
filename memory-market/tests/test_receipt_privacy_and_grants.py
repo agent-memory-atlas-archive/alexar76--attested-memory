@@ -4,11 +4,8 @@
   then never added its ``created`` receipt. Only a ``created`` receipt sets ``attested`` now.
 * lineage.get@v1 is open to any hub caller, and the payment receipt named the buyer and the
   transaction: anyone could list who bought a paid memory. It now carries a commitment.
-* The receipt of a unit that is not public carried its source_refs, which the catalogue withholds.
-  It now carries a hash of each reference.
-* The catalogue showed every unit's evidence_pack_id, and evidence.pack@v1 returns the claim to
-  anyone with the id. Only a caller who may read the unit gets the id; the verification receipt
-  of a non-public unit carries a hash of it.
+* Public lineage omits source references, parent ids and evidence pack identifiers from non-public units.
+* The catalogue exposes the evidence pack id only to callers who may read its memory.
 * An owner could share a memory but never take the access back. They can now, except access that
   was paid for.
 """
@@ -104,7 +101,7 @@ def test_the_payment_receipt_names_neither_buyer_nor_transaction(market, recorde
     assert sent["metadata"]["settlement"] == sha("ord_1|0xabc|agent:buyer")
 
 
-def test_receipts_of_units_that_are_not_public_hash_their_sources_and_parents(market, monkeypatch):
+def test_receipts_only_include_public_sources_and_parents(market, monkeypatch):
     posted = []
 
     def fake_post(url, json, headers, timeout):
@@ -114,15 +111,14 @@ def test_receipts_of_units_that_are_not_public_hash_their_sources_and_parents(ma
     monkeypatch.setattr(clients_module.httpx, "post", fake_post)
     clients = TrustClients(SimpleNamespace(provenance_url="http://ledger", provenance_token="t"))
     ref = "https://example.org/private-source"
-    for visibility, expected in (("public", [ref]), ("paid", [sha(ref)]), ("private", [sha(ref)]),
-                                 ("shared", [sha(ref)])):
+    for visibility in ("public", "paid", "private", "shared"):
         parent = "mem_" + "d" * 24
         unit = market.create(MemoryCreate(title=visibility, content="body", visibility=visibility,
                                           price_usdc="1.00" if visibility == "paid" else None,
                                           source_refs=[ref], parent_memory_ids=[parent]), "agent:owner")
         clients.attest(unit, "created", "agent:owner")
-        assert posted[-1]["source_refs"] == expected, visibility
-        assert posted[-1]["parent_memory_ids"] == ([parent] if visibility == "public" else [sha(parent)])
+        assert posted[-1]["source_refs"] == ([ref] if visibility == "public" else []), visibility
+        assert posted[-1]["parent_memory_ids"] == ([parent] if visibility == "public" else [])
 
 
 def test_the_evidence_pack_id_reaches_only_readers(market, recorder):
@@ -145,10 +141,10 @@ def test_the_evidence_pack_id_reaches_only_readers(market, recorder):
     market.grant(paid.id, "agent:reader", "agent:owner")
     assert pack_seen("agent:reader", paid) == pack
     assert pack_seen(None, public) == pack
-    # The ledger receipt: the id for the public unit, a hash of it for the paid one.
+    # Only the public receipt can identify its evidence pack.
     verified = {s["memory_id"]: s["metadata"] for s in recorder.sent if s["event_type"] == "verified"}
     assert verified[public.id]["evidence_pack_id"] == pack
-    assert verified[paid.id] == {"status": "supported", "confidence": 0.9, "evidence_pack_ref": sha(pack)}
+    assert verified[paid.id] == {"status": "supported", "confidence": 0.9}
 
 
 def test_an_owner_revokes_access_they_gave_but_not_access_that_was_paid_for(market):
@@ -164,6 +160,7 @@ def test_an_owner_revokes_access_they_gave_but_not_access_that_was_paid_for(mark
     revoked = _invoke("memory.share@v1", {"memory_id": unit.id, "grantee_id": "aimarket:" + BOB, "revoke": True},
                       {"X-AIMarket-Buyer-Ref": ALICE})
     assert revoked["revoked_at"] and not market.can_read(unit, "aimarket:" + BOB)
+    market.revoke(unit.id, "aimarket:" + BOB, "aimarket:" + ALICE)
     with pytest.raises(HTTPException) as missing:
         _invoke("memory.share@v1", {"memory_id": unit.id, "grantee_id": "aimarket:nobody", "revoke": True},
                 {"X-AIMarket-Buyer-Ref": ALICE})
@@ -171,6 +168,11 @@ def test_an_owner_revokes_access_they_gave_but_not_access_that_was_paid_for(mark
     # Sharing again restores it.
     _invoke("memory.share@v1", {"memory_id": unit.id, "grantee_id": "aimarket:" + BOB}, {"X-AIMarket-Buyer-Ref": ALICE})
     assert market.can_read(unit, "aimarket:" + BOB)
+    events = market.connection.execute(
+        "SELECT * FROM memory_grant_events WHERE memory_id = ? ORDER BY occurred_at, id", (unit.id,)
+    ).fetchall()
+    assert [event["event_type"] for event in events] == ["granted", "revoked", "granted"]
+    assert all(event["grant_id"] == revoked["id"] and event["actor_id"] == "aimarket:" + ALICE for event in events)
 
     # REST, and a grant that a confirmed payment issued.
     paid = _paid(market)

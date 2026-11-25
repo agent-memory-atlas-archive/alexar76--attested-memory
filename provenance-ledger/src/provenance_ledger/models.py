@@ -68,6 +68,7 @@ class Lineage(BaseModel):
 
 class VerifyRequest(BaseModel):
     receipt_id: str
+    full_chain: bool = False
 
 
 class VerifyResult(BaseModel):

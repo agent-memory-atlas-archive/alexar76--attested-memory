@@ -93,6 +93,11 @@ class Client:
         path = "/memory/api/memories/" + urllib.parse.quote(memory_id, safe="")
         return check_integrity(self._request("GET", path))
 
+    def read_evidence(self, memory_id: str) -> dict[str, Any]:
+        """Read the current evidence pack for a memory you can access."""
+        path = "/memory/api/memories/" + urllib.parse.quote(memory_id, safe="") + "/evidence-pack"
+        return self._request("GET", path)
+
     def search(self, query: str = "", limit: int = 30) -> dict[str, Any]:
         params = urllib.parse.urlencode({"q": query, "limit": max(1, min(int(limit), 100))})
         return self._request("GET", "/memory/api/search?" + params)

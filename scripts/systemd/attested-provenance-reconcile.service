@@ -1,9 +1,9 @@
 # Memory Market <-> Provenance Ledger, once an hour (timer beside this file):
 #  1. attest units whose write-time receipt never landed (a ledger outage leaves them unattested);
 #  2. --check: every attested unit's recorded receipt must still be in its ledger chain with the
-#     chain root the ledger returned, and must verify. A mismatch fails this unit (exit 2) and is
+#     chain root the ledger returned, and the full lineage must verify. A mismatch fails this unit (exit 2) and is
 #     printed to the journal: journalctl -u attested-provenance-reconcile
-# Install: copy both files to /etc/systemd/system, then systemctl enable --now attested-provenance-reconcile.timer
+# Install with scripts/install-provenance-reconcile.sh on the Compose host.
 [Unit]
 Description=Attested Memory: reconcile and cross-check provenance receipts
 After=docker.service

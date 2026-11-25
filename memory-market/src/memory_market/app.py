@@ -371,6 +371,23 @@ def read_memory(memory_id: str, actor_id: str | None = Depends(optional_actor), 
     return unit
 
 
+@app.get("/v1/memories/{memory_id}/evidence-pack")
+def read_memory_evidence(
+    memory_id: str, actor_id: str | None = Depends(optional_actor),
+    team_id: str | None = Depends(team_context), settings: Settings = Depends(get_settings),
+) -> dict:
+    try:
+        unit = store().get_unchecked(memory_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="evidence pack not found") from None
+    if not store().can_read(unit, actor_id, team_id) or not unit.truth.evidence_pack_id:
+        raise HTTPException(status_code=404, detail="evidence pack not found")
+    pack = TrustClients(settings).evidence_pack(unit)
+    if pack is None:
+        raise HTTPException(status_code=503, detail="evidence pack unavailable")
+    return pack
+
+
 @app.post("/v1/memories/{memory_id}/grants", response_model=Grant)
 def share_memory(memory_id: str, request: GrantCreate, actor_id: str = Depends(require_actor)) -> Grant:
     try:
@@ -423,7 +440,7 @@ def verify_memory(
     receipt = TrustClients(settings).attest(
         updated, "verified", "truth-layer",
         {"status": result["status"], "confidence": result["confidence"],
-         **({"evidence_pack_id": pack} if updated.visibility == "public" else {"evidence_pack_ref": commitment(pack)})},
+         **({"evidence_pack_id": pack} if updated.visibility == "public" else {})},
     )
     if receipt:
         store().set_provenance(unit.id, receipt["id"], receipt["chain_root"], created=False)
@@ -515,6 +532,18 @@ def _aimarket_actor(request: Request) -> str | None:
     if not _BUYER_REF.fullmatch(ref):
         return None
     return "aimarket:" + ref
+
+
+@app.get("/internal/evidence-access/{memory_id}", status_code=204, include_in_schema=False,
+         dependencies=[Depends(require_capability_access)])
+def evidence_access(memory_id: str, request: Request) -> Response:
+    try:
+        unit = store().get_unchecked(memory_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="memory not found") from None
+    if not store().can_read(unit, _aimarket_actor(request)):
+        raise HTTPException(status_code=404, detail="memory not found")
+    return Response(status_code=204)
 
 
 def _public_base(default_port: int) -> str:

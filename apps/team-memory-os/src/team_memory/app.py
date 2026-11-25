@@ -96,6 +96,11 @@ def read(memory_id: str, request: Request, team_id: str) -> Any:
     return _call("GET", f"/v1/memories/{memory_id}", request, team_id=team_id)
 
 
+@app.get("/api/team-memories/{memory_id}/evidence-pack")
+def read_evidence(memory_id: str, request: Request, team_id: str) -> Any:
+    return _call("GET", f"/v1/memories/{memory_id}/evidence-pack", request, team_id=team_id)
+
+
 def _gateway_team(request: Request, method: str, path: str, **kwargs: Any) -> Any:
     saas_key = request.headers.get("x-saas-key", "")
     actor_headers = {

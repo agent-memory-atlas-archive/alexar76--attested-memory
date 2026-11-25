@@ -1,9 +1,22 @@
 # Production PostgreSQL profile
 
 Production starts PostgreSQL 16 and refuses to boot a Hub/service when a required
-store has no PostgreSQL DSN. The stores use separate environment variables and
-independent `psycopg` pools; they may point at one PostgreSQL database or separate
-databases.
+store has no PostgreSQL DSN. The bundled Compose configuration gives Memory
+Market, Truth Layer and Provenance Ledger one database and one login. Each service
+has its own DSN setting and connection pool. Operators can provide separate databases.
+
+Install the hourly reconcile and full-lineage check on the standard Compose host
+with `sudo ./scripts/install-provenance-reconcile.sh`. It installs both systemd
+units and enables the timer. Inspect runs with
+`journalctl -u attested-provenance-reconcile.service`.
+
+Use `python -m memory_market.reconcile_provenance --export-heads` from the Memory
+Market environment to record verified heads. Keep the JSON private in storage
+whose credentials are separate from the database and service account. Compare
+with that trusted file using `--check --against /path/to/retained-heads.json`.
+The comparison requires every retained receipt and root to remain in its
+memory's available lineage. The timer runs the database-backed comparison by
+default. Independent retention and the choice of checkpoint are operator tasks.
 
 SQLite remains available only when `AIFACTORY_PROD` is unset, for development and
 tests. Existing files can be copied with `scripts/migrate_sqlite_to_postgres.py`.

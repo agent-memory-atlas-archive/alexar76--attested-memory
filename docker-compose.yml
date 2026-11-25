@@ -198,6 +198,7 @@ services:
     build: ./truth-layer
     environment:
       TRUTH_LAYER_DB: /data/truth-layer.sqlite3
+      MEMORY_MARKET_URL: http://memory-market:8810
       TRUTH_LAYER_DATABASE_URL: postgresql://${POSTGRES_USER:-aicom}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-aicom}
       AIFACTORY_PROD: "1"
       AIMARKET_CAPABILITY_TOKEN: ${AIMARKET_CAPABILITY_TOKEN:?run ./start.sh}

@@ -4,7 +4,8 @@ This MVP binds published Compose ports to loopback and is not ready for direct I
 
 ## Trust boundaries
 
-- Memory content stays in the market database. Provenance stores only hashes and caller-provided source references; the market hashes the references of units that are not public, and its payment receipts commit to the buyer and transaction instead of naming them, because any hub caller can read a lineage.
+- The market keeps memory content behind its access checks. The Truth Layer stores claims and evidence. When returning a pack tied to a market memory through the hub, it checks the current buyer's access with Memory Market. A pack identifier alone carries no authority.
+- Anyone can read a lineage through the hub. New receipts for non-public units omit source references, parent ids and evidence pack ids. Earlier signed receipts keep their original fields. A payment receipt commits to its order, buyer and transaction.
 - An attestation proves that this node signed a specific event in a specific chain. It does not prove the underlying claim is true.
 - Truth scores are deterministic summaries of submitted evidence. They are not independent fact checking and must not be marketed as such.
 - Paid access fails closed while `PAYMENT_RECIPIENT` is empty. No endpoint treats invoice creation or a client-provided transaction hash as settlement.
@@ -13,6 +14,8 @@ This MVP binds published Compose ports to loopback and is not ready for direct I
 - Operator endpoints use bearer tokens in the MVP. Put the services behind TLS and an identity-aware gateway before public use.
 - Health endpoints execute `SELECT 1` and return HTTP 503 when their database is unavailable; container health no longer reports a false positive.
 - Provenance appends lock a per-memory chain head in PostgreSQL, preventing two workers from creating competing successors.
+- Memory Market records successful owner-managed grant and revoke events in the same transaction as each change. The events stay in the market database and carry the owner and grantee ids. The shared database administrator can modify those records.
+- Reconciliation verifies all receipts in the available chain. Comparing with a previously exported head requires the buyer or operator to retain that export outside the shared database's administrative boundary.
 
 ## Post-quantum policy
 

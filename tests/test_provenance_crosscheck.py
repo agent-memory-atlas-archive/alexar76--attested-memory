@@ -11,7 +11,7 @@ import pytest
 
 from memory_market.clients import receipt_parents, receipt_refs
 from memory_market.models import MemoryCreate
-from memory_market.reconcile_provenance import check, reconcile
+from memory_market.reconcile_provenance import check, main, read_heads, reconcile
 from memory_market.store import MemoryStore
 from provenance_ledger.crypto import Signer
 from provenance_ledger.models import AttestationCreate
@@ -29,7 +29,7 @@ class LedgerClients:
 
     def verify_receipt(self, receipt_id):
         try:
-            return self.ledger.verify(receipt_id).model_dump(mode="json")
+            return self.ledger.verify(receipt_id, full_chain=True).model_dump(mode="json")
         except KeyError:
             return {"receipt_id": receipt_id, "valid": False, "checks": {"exists": False}}
 
@@ -101,6 +101,47 @@ def test_check_finds_a_rewritten_receipt(pair):
         ledger.connection.execute("UPDATE receipts SET actor_id = 'someone' WHERE id = ?", (receipt_id,))
     problem = check(store, clients)["mismatched"][0]["problem"]
     assert problem.startswith("the ledger does not verify the receipt: ") and "event_hash" in problem
+
+
+def test_check_validates_each_receipt_beyond_the_recorded_market_receipt(pair):
+    store, ledger, clients = pair
+    unit = store.create(MemoryCreate(title="kept", content="one"), "agent:owner")
+    reconcile(store, clients)
+    anchor = store.get_unchecked(unit.id).provenance.receipt_id
+    later = clients.attest(unit, "verified", "truth-layer")
+    assert check(store, clients)["matching"] == 1
+
+    with ledger.connection:
+        ledger.connection.execute("UPDATE receipts SET actor_id = ? WHERE id = ?", ("wrong-actor", later["id"]))
+    assert ledger.verify(anchor).valid
+    assert check(store, clients)["mismatched"][0]["problem"] == "the ledger does not verify the receipt: full_lineage"
+
+
+def test_retained_head_guards_a_later_suffix(pair, monkeypatch, tmp_path, capsys):
+    import memory_market.app as market_app
+    import memory_market.reconcile_provenance as provenance
+
+    store, ledger, clients = pair
+    unit = store.create(MemoryCreate(title="kept", content="one"), "agent:owner")
+    reconcile(store, clients)
+    first = ledger.lineage(unit.id).receipts[0]
+    later = clients.attest(unit, "verified", "truth-layer")
+    monkeypatch.setattr(market_app, "store", lambda: store)
+    monkeypatch.setattr(provenance, "TrustClients", lambda _: clients)
+    assert main(["--export-heads"]) == 0
+    checkpoint = tmp_path / "retained-heads.json"
+    checkpoint.write_text(capsys.readouterr().out)
+    assert read_heads(checkpoint)[unit.id] == {"receipt_id": later["id"], "chain_root": later["chain_root"]}
+    assert main(["--check", "--against", str(checkpoint)]) == 0
+    capsys.readouterr()
+
+    with ledger.connection:
+        ledger.connection.execute("DELETE FROM receipts WHERE id = ?", (later["id"],))
+        ledger.connection.execute("UPDATE receipt_heads SET chain_root = ? WHERE memory_id = ?",
+                                  (first.chain_root, unit.id))
+    assert check(store, clients)["matching"] == 1
+    assert main(["--check", "--against", str(checkpoint)]) == 2
+    assert "independently retained head is no longer in the ledger chain" in capsys.readouterr().out
 
 
 def test_a_payment_receipt_before_the_creation_receipt_leaves_the_unit_for_reconcile(pair):

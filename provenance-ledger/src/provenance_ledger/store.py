@@ -266,11 +266,7 @@ class Ledger:
         own = {self.signer.pq_public_key} if self.signer.pq_public_key else set()
         return own | extra
 
-    def verify(self, receipt_id: str) -> VerifyResult:
-        row = self.connection.execute("SELECT * FROM receipts WHERE id = ?", (receipt_id,)).fetchone()
-        if row is None:
-            raise KeyError(receipt_id)
-        receipt = self._receipt(row)
+    def _signed_receipt_checks(self, receipt: Receipt) -> dict[str, bool]:
         event = {
             "id": receipt.id,
             "memory_id": receipt.memory_id,
@@ -282,21 +278,33 @@ class Ledger:
             "metadata": receipt.metadata,
             "created_at": receipt.created_at,
         }
-        event_ok = sha256(canonical_json(event)) == receipt.event_hash
-        root_ok = sha256(receipt.previous_root + ":" + receipt.event_hash) == receipt.chain_root
-        signature_ok = Signer.verify(receipt.public_key, receipt.chain_root, receipt.signature)
-        pq_signature_ok = Signer.verify_pq(receipt.pq_public_key, receipt.chain_root, receipt.pq_signature)
-        previous_row = self.connection.execute(
-            "SELECT chain_root FROM receipts WHERE memory_id = ? AND sequence < ? ORDER BY sequence DESC LIMIT 1",
-            (receipt.memory_id, row["sequence"]),
-        ).fetchone()
-        expected_previous = previous_row["chain_root"] if previous_row else GENESIS_ROOT
-        link_ok = expected_previous == receipt.previous_root
         # A signature is only evidence if it is the ledger's own: the row carries its public key, so
         # checking against that key alone let anyone who can rewrite a row re-hash and re-sign it.
         signer_ok = receipt.public_key in self.trusted_public_keys() and (
             receipt.pq_public_key is None or receipt.pq_public_key in self.trusted_pq_public_keys()
         )
+        return {
+            "event_hash": sha256(canonical_json(event)) == receipt.event_hash,
+            "chain_root": sha256(receipt.previous_root + ":" + receipt.event_hash) == receipt.chain_root,
+            "signature": Signer.verify(receipt.public_key, receipt.chain_root, receipt.signature),
+            "pq_signature": Signer.verify_pq(receipt.pq_public_key, receipt.chain_root, receipt.pq_signature),
+            "signer_key": signer_ok,
+        }
+
+    def verify(self, receipt_id: str, *, full_chain: bool = False) -> VerifyResult:
+        if full_chain:
+            return self._verify_full_chain(receipt_id)
+        row = self.connection.execute("SELECT * FROM receipts WHERE id = ?", (receipt_id,)).fetchone()
+        if row is None:
+            raise KeyError(receipt_id)
+        receipt = self._receipt(row)
+        checks = self._signed_receipt_checks(receipt)
+        previous_row = self.connection.execute(
+            "SELECT chain_root FROM receipts WHERE memory_id = ? AND sequence < ? ORDER BY sequence DESC LIMIT 1",
+            (receipt.memory_id, row["sequence"]),
+        ).fetchone()
+        expected_previous = previous_row["chain_root"] if previous_row else GENESIS_ROOT
+        checks["previous_link"] = expected_previous == receipt.previous_root
         # The newest stored receipt of the memory must be the chain head the ledger recorded, so
         # deleting the latest receipts of a chain is not invisible, and a deleted head row stays
         # missing (it is not rebuilt at start). Both live in this database, so this catches lost or
@@ -310,10 +318,33 @@ class Ledger:
             "SELECT chain_root FROM receipts WHERE memory_id = ? ORDER BY sequence DESC LIMIT 1",
             (receipt.memory_id,),
         ).fetchone()
-        head_ok = head is not None and last is not None and head["chain_root"] == last["chain_root"]
-        checks = {
-            "event_hash": event_ok, "chain_root": root_ok, "signature": signature_ok,
-            "pq_signature": pq_signature_ok, "previous_link": link_ok,
-            "signer_key": signer_ok, "chain_head": head_ok,
-        }
+        checks["chain_head"] = head is not None and last is not None and head["chain_root"] == last["chain_root"]
         return VerifyResult(receipt_id=receipt.id, valid=all(checks.values()), checks=checks)
+
+    def _verify_full_chain(self, receipt_id: str) -> VerifyResult:
+        # Read the chain and head from one database snapshot, including concurrent appends.
+        rows = self.connection.execute(
+            """SELECT r.*, h.chain_root AS recorded_head FROM receipts r
+               LEFT JOIN receipt_heads h ON h.memory_id = r.memory_id
+               WHERE r.memory_id = (SELECT memory_id FROM receipts WHERE id = ?)
+               ORDER BY r.sequence""",
+            (receipt_id,),
+        ).fetchall()
+        if not rows:
+            raise KeyError(receipt_id)
+
+        expected_previous = GENESIS_ROOT
+        full_lineage = True
+        anchor_checks: dict[str, bool] = {}
+        for row in rows:
+            receipt = self._receipt(row)
+            receipt_checks = self._signed_receipt_checks(receipt)
+            receipt_checks["previous_link"] = receipt.previous_root == expected_previous
+            if not all(receipt_checks.values()):
+                full_lineage = False
+            if receipt.id == receipt_id:
+                anchor_checks = receipt_checks
+            expected_previous = receipt.chain_root
+        anchor_checks["chain_head"] = rows[-1]["recorded_head"] == expected_previous
+        anchor_checks["full_lineage"] = full_lineage
+        return VerifyResult(receipt_id=receipt_id, valid=all(anchor_checks.values()), checks=anchor_checks)

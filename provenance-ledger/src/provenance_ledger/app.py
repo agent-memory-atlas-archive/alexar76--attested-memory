@@ -115,7 +115,7 @@ def get_lineage(memory_id: str) -> Lineage:
 @app.post("/v1/receipts/verify", response_model=VerifyResult, dependencies=[Depends(require_admin)])
 def verify_receipt(request: VerifyRequest) -> VerifyResult:
     try:
-        return ledger().verify(request.receipt_id)
+        return ledger().verify(request.receipt_id, full_chain=request.full_chain)
     except KeyError:
         raise HTTPException(status_code=404, detail="receipt not found") from None
 

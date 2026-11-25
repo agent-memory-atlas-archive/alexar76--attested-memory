@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 import hmac
+import re
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import ValidationError
 
@@ -115,6 +117,33 @@ def evidence_pack(pack_id: str) -> EvidencePack:
         raise HTTPException(status_code=404, detail="evidence pack not found") from None
 
 
+_MARKET_MEMORY_ID = re.compile(r"mem_[0-9a-f]{24}")
+
+
+def require_hub_pack_access(pack: EvidencePack, request: Request) -> None:
+    if not pack.memory_id or not _MARKET_MEMORY_ID.fullmatch(pack.memory_id):
+        return
+    market = os.getenv("MEMORY_MARKET_URL", "").rstrip("/")
+    if not market:
+        raise HTTPException(status_code=503, detail="memory access check unavailable")
+    try:
+        decision = httpx.get(
+            f"{market}/internal/evidence-access/{pack.memory_id}",
+            headers={
+                "X-AIMarket-Internal-Token": os.getenv("AIMARKET_CAPABILITY_TOKEN", ""),
+                "X-AIMarket-Buyer-Ref": request.headers.get("x-aimarket-buyer-ref", ""),
+            },
+            timeout=5,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="memory access check unavailable") from None
+    if decision.status_code == 404:
+        raise HTTPException(status_code=404, detail="evidence pack not found")
+    if decision.status_code != 204:
+        raise HTTPException(status_code=503, detail="memory access check unavailable")
+
+
 def _public_base(default_port: int) -> str:
     """Where this service can be REACHED from outside, for its own well-known.
 
@@ -171,7 +200,9 @@ def invoke_capability(
             parsed = ContradictionScanRequest.model_validate(payload)
             result = scan_contradictions(parsed.statements).model_dump(mode="json")
         else:
-            result = store().get(str(payload.get("pack_id") or "")).model_dump(mode="json")
+            pack = store().get(str(payload.get("pack_id") or ""))
+            require_hub_pack_access(pack, request)
+            result = pack.model_dump(mode="json")
     except KeyError:
         raise HTTPException(status_code=404, detail="evidence pack not found") from None
     except ValidationError as error:

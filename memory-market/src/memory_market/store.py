@@ -72,6 +72,17 @@ class MemoryStore:
                     revoked_at TEXT,
                     UNIQUE(memory_id, grantee_id)
                 );
+                CREATE TABLE IF NOT EXISTS memory_grant_events (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    grant_id TEXT NOT NULL,
+                    grantee_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK (event_type IN ('granted','revoked')),
+                    occurred_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_grant_events_memory
+                ON memory_grant_events(memory_id, occurred_at, id);
                 CREATE TABLE IF NOT EXISTS ratings (
                     memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
                     actor_id TEXT NOT NULL,
@@ -385,17 +396,15 @@ class MemoryStore:
             raise PermissionError("only the owner can grant access")
         grant_id = "grant_" + uuid4().hex[:24]
         created_at = now()
-        with self.connection:
-            self.connection.execute(
+        with self.lock, self.connection:
+            row = self.connection.execute(
                 """INSERT INTO grants (id, memory_id, grantee_id, granted_by, created_at, revoked_at)
                 VALUES (?, ?, ?, ?, ?, NULL)
-                ON CONFLICT(memory_id, grantee_id) DO UPDATE SET revoked_at = NULL, granted_by = excluded.granted_by, created_at = excluded.created_at""",
+                ON CONFLICT(memory_id, grantee_id) DO UPDATE SET revoked_at = NULL, granted_by = excluded.granted_by, created_at = excluded.created_at
+                RETURNING id, memory_id, grantee_id, granted_by, created_at""",
                 (grant_id, memory_id, grantee_id, actor_id, created_at),
-            )
-        row = self.connection.execute(
-            "SELECT id, memory_id, grantee_id, granted_by, created_at FROM grants WHERE memory_id = ? AND grantee_id = ?",
-            (memory_id, grantee_id),
-        ).fetchone()
+            ).fetchone()
+            self._record_grant_event(memory_id, row["id"], grantee_id, actor_id, "granted", created_at)
         return Grant(**dict(row))
 
     def revoke(self, memory_id: str, grantee_id: str, actor_id: str) -> Grant:
@@ -405,9 +414,10 @@ class MemoryStore:
         if unit.owner_id != actor_id:
             raise PermissionError("only the owner can revoke access")
         with self.lock, self.connection:
+            lock = " FOR UPDATE" if self.connection.is_postgres else ""
             row = self.connection.execute(
                 "SELECT id, memory_id, grantee_id, granted_by, created_at, revoked_at FROM grants "
-                "WHERE memory_id = ? AND grantee_id = ?", (memory_id, grantee_id),
+                "WHERE memory_id = ? AND grantee_id = ?" + lock, (memory_id, grantee_id),
             ).fetchone()
             if row is None:
                 raise LookupError("no grant for this grantee")
@@ -416,13 +426,20 @@ class MemoryStore:
             ).fetchone() is not None:
                 raise PermissionError("this access was paid for; the owner cannot revoke it")
             if row["revoked_at"] is None:
+                revoked_at = now()
                 self.connection.execute(
-                    "UPDATE grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (now(), row["id"]))
-        row = self.connection.execute(
-            "SELECT id, memory_id, grantee_id, granted_by, created_at, revoked_at FROM grants WHERE id = ?",
-            (row["id"],),
-        ).fetchone()
-        return Grant(**dict(row))
+                    "UPDATE grants SET revoked_at = ? WHERE id = ?", (revoked_at, row["id"]))
+                self._record_grant_event(memory_id, row["id"], grantee_id, actor_id, "revoked", revoked_at)
+                return Grant(**(dict(row) | {"revoked_at": revoked_at}))
+            return Grant(**dict(row))
+
+    def _record_grant_event(self, memory_id: str, grant_id: str, grantee_id: str,
+                            actor_id: str, event_type: str, occurred_at: str) -> None:
+        self.connection.execute(
+            "INSERT INTO memory_grant_events (id, memory_id, grant_id, grantee_id, actor_id, event_type, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (uuid4().hex, memory_id, grant_id, grantee_id, actor_id, event_type, occurred_at),
+        )
 
     def score(self, memory_id: str, actor_id: str, score: int) -> ScoreResult:
         self.get_unchecked(memory_id)

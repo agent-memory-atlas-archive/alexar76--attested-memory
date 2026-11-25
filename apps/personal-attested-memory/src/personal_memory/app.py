@@ -83,6 +83,11 @@ def read(memory_id: str, request: Request) -> Any:
     return _call("GET", f"/v1/memories/{memory_id}", request)
 
 
+@app.get("/api/memories/{memory_id}/evidence-pack")
+def read_evidence(memory_id: str, request: Request) -> Any:
+    return _call("GET", f"/v1/memories/{quote(memory_id, safe='')}/evidence-pack", request)
+
+
 # Sharing and revoking go to the Memory Market as they are; the caller's actor proof names the
 # market's path (with the ids percent-decoded, as the market reads it) and, for a share, the exact
 # body bytes, so the proxy forwards the raw body and quotes the ids only for transport.

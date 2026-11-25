@@ -12,7 +12,7 @@ AIMarket Hub :9084 --------+---------------- Independent Alien Monitor
   |
   +-- memory-market :8810  ---- claim + evidence ----> truth-layer :8811
   |        |                                            (4 capabilities)
-  |        +-- durable memory, grants, ratings --> SQLite
+  |        +-- durable memory, grants, ratings --> PostgreSQL (SQLite in development)
   |        +-- finalized USDC Transfer ----------> access grant
   |                    ^
   |                    +---- Base RPC (read-only; funds go to operator wallet)
@@ -21,7 +21,13 @@ AIMarket Hub :9084 --------+---------------- Independent Alien Monitor
                   content hash + source refs          (3 capabilities)
 ```
 
-All cross-service calls are HTTP and optional. A memory can still be written when a trust service is temporarily unavailable; its state remains `unverified` or `unattested` and can be reconciled later. The market never invents a successful verification or attestation. Both writes (REST and the hub's `memory.write@v1`) ask the ledger for a `created` receipt; `python -m memory_market.reconcile_provenance` attests the units still `unattested` and first links a `created` receipt that already landed, so a rerun never doubles one (`--count` only counts); it links only a receipt in the unit owner's name. `--check` compares from outside the ledger: each attested unit's recorded receipt must still be in its chain, with the chain root the ledger returned on append, and must verify. The ledger's own `chain_head` check compares its database with itself, so it cannot catch a writer who deletes receipts and moves the head together; the market's copy of the root can. `scripts/systemd/attested-provenance-reconcile.{service,timer}` run both every hour. Search and catalog leave out memories the Truth Layer `rejected` unless `truth` asks for them (`truth=supported`, `truth=any`); a rejected memory stays readable by id, with its status.
+Cross-service calls use HTTP. Memory writes can still succeed during a trust service outage and keep the record `unverified` or `unattested`. Hub reads of a pack tied to a Memory Market memory require a current access decision from the market.
+
+Both REST writes and `memory.write@v1` ask the ledger for a `created` receipt. `python -m memory_market.reconcile_provenance` retries unattested units. It first looks for a creation receipt in the owner's name so a lost response can be reconciled. `--count` reports pending units.
+
+`--check` requires the receipt and root kept by Memory Market to appear in the ledger chain and verifies the available chain from genesis through its current head. The bundled services share one PostgreSQL database and one role. A writer to that database can alter the ledger and the market's reference together. An independently retained head export lets the operator check an older observation against the current chain.
+
+Search and catalog omit memories the Truth Layer `rejected` unless the caller asks for that status or `truth=any`. A rejected memory stays readable by id to an authorized reader, with its status.
 
 ## One object, three concerns
 
