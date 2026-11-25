@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from typing import Any
 
 import httpx
@@ -13,7 +13,11 @@ HUB = os.getenv("MEMORY_MARKET_URL", "http://localhost:8810").rstrip("/")
 API_KEY = os.getenv("MEMORY_MARKET_API_KEY", "")
 GATEWAY = os.getenv("SAAS_GATEWAY_URL", "http://localhost:9400").rstrip("/")
 GATEWAY_TOKEN = os.getenv("SAAS_GATEWAY_API_KEY", "")
-app = FastAPI(title="Personal Attested Memory", version="1.0.0")
+app = FastAPI(title="Personal Attested Memory", version="1.1.0")
+
+
+class GrantBody(BaseModel):
+    grantee_id: str = Field(min_length=1, max_length=120)
 
 
 class MemoryBody(BaseModel):
@@ -77,3 +81,17 @@ def write(body: MemoryBody, request: Request) -> Any:
 @app.get("/api/memories/{memory_id}")
 def read(memory_id: str, request: Request) -> Any:
     return _call("GET", f"/v1/memories/{memory_id}", request)
+
+
+# Sharing and revoking go to the Memory Market as they are; the caller's actor proof names the
+# market's path (with the ids percent-decoded, as the market reads it) and, for a share, the exact
+# body bytes, so the proxy forwards the raw body and quotes the ids only for transport.
+@app.post("/api/memories/{memory_id}/grants")
+def share(memory_id: str, body: GrantBody, request: Request) -> Any:
+    return _call("POST", f"/v1/memories/{quote(memory_id, safe='')}/grants", request, content=request._body)
+
+
+@app.delete("/api/memories/{memory_id}/grants/{grantee_id:path}")
+def revoke(memory_id: str, grantee_id: str, request: Request) -> Any:
+    return _call("DELETE", f"/v1/memories/{quote(memory_id, safe='')}/grants/{quote(grantee_id, safe='')}", request)
+

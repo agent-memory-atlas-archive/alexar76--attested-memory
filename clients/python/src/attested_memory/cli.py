@@ -5,6 +5,8 @@
     attested-memory write "Title" "Text"     # or: --file notes.md
     attested-memory search "supplier"
     attested-memory read mem_…
+    attested-memory share mem_… did:actor:…  # let another actor read it
+    attested-memory revoke mem_… did:actor:… # take that back
 
 Environment: ATTESTED_MEMORY_HOME (config dir), ATTESTED_MEMORY_URL (default
 https://attestedmemory.net), ATTESTED_MEMORY_API_KEY (instead of the stored trial key).
@@ -111,6 +113,16 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_share(args: argparse.Namespace) -> int:
+    _print(_client(args).share(args.memory_id, args.grantee_id))
+    return 0
+
+
+def cmd_revoke(args: argparse.Namespace) -> int:
+    _print(_client(args).revoke(args.memory_id, args.grantee_id))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="attested-memory", description="Verifiable memory for AI agents.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -136,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--limit", type=int, default=30)
     search.set_defaults(func=cmd_search)
+    share = sub.add_parser("share", help="let another actor read a memory you own")
+    share.add_argument("memory_id")
+    share.add_argument("grantee_id", help="the other actor's id (did:actor:…)")
+    share.set_defaults(func=cmd_share)
+    revoke = sub.add_parser("revoke", help="withdraw access you gave with share")
+    revoke.add_argument("memory_id")
+    revoke.add_argument("grantee_id")
+    revoke.set_defaults(func=cmd_revoke)
     return parser
 
 

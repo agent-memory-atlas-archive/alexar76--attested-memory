@@ -4,7 +4,7 @@ This MVP binds published Compose ports to loopback and is not ready for direct I
 
 ## Trust boundaries
 
-- Memory content stays in the market database. Provenance stores only hashes and caller-provided source references.
+- Memory content stays in the market database. Provenance stores only hashes and caller-provided source references; the market hashes the references of units that are not public, and its payment receipts commit to the buyer and transaction instead of naming them, because any hub caller can read a lineage.
 - An attestation proves that this node signed a specific event in a specific chain. It does not prove the underlying claim is true.
 - Truth scores are deterministic summaries of submitted evidence. They are not independent fact checking and must not be marketed as such.
 - Paid access fails closed while `PAYMENT_RECIPIENT` is empty. No endpoint treats invoice creation or a client-provided transaction hash as settlement.

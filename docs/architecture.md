@@ -21,7 +21,7 @@ AIMarket Hub :9084 --------+---------------- Independent Alien Monitor
                   content hash + source refs          (3 capabilities)
 ```
 
-All cross-service calls are HTTP and optional. A memory can still be written when a trust service is temporarily unavailable; its state remains `unverified` or `unattested` and can be reconciled later. The market never invents a successful verification or attestation. Both writes (REST and the hub's `memory.write@v1`) ask the ledger for a `created` receipt; `python -m memory_market.reconcile_provenance` attests the units still `unattested` and first links a `created` receipt that already landed, so a rerun never doubles one (`--count` only counts). Search and catalog leave out memories the Truth Layer `rejected` unless `truth` asks for them (`truth=supported`, `truth=any`); a rejected memory stays readable by id, with its status.
+All cross-service calls are HTTP and optional. A memory can still be written when a trust service is temporarily unavailable; its state remains `unverified` or `unattested` and can be reconciled later. The market never invents a successful verification or attestation. Both writes (REST and the hub's `memory.write@v1`) ask the ledger for a `created` receipt; `python -m memory_market.reconcile_provenance` attests the units still `unattested` and first links a `created` receipt that already landed, so a rerun never doubles one (`--count` only counts); it links only a receipt in the unit owner's name. `--check` compares from outside the ledger: each attested unit's recorded receipt must still be in its chain, with the chain root the ledger returned on append, and must verify. The ledger's own `chain_head` check compares its database with itself, so it cannot catch a writer who deletes receipts and moves the head together; the market's copy of the root can. `scripts/systemd/attested-provenance-reconcile.{service,timer}` run both every hour. Search and catalog leave out memories the Truth Layer `rejected` unless `truth` asks for them (`truth=supported`, `truth=any`); a rejected memory stays readable by id, with its status.
 
 ## One object, three concerns
 
@@ -45,7 +45,7 @@ The three folders are intentionally separate build contexts. They can be deploye
 
 1. Tenant identity and scoped API keys.
 2. Embedding provider adapter and hybrid search.
-3. Durable verification jobs, and a timer for `reconcile_provenance` in the bundled deploy.
+3. Durable verification jobs.
 4. Optional Hub-level x402/escrow integration and publisher revenue splitting; direct Base USDC settlement is already implemented in Memory Market.
 5. Encrypted content storage and per-grant key wrapping.
 6. Automated rotation and pinning workflow for Ed25519 and ML-DSA-65 federation identity.

@@ -2,6 +2,17 @@
 
 Notable changes to the `attested-memory` Python client. Earlier releases: the git history.
 
+## 0.3.0 — 2026-11-25
+
+### Added
+- `Client.share(memory_id, grantee_id)` and `Client.revoke(memory_id, grantee_id)`, and the CLI commands
+  `attested-memory share` and `attested-memory revoke`. An owner lets another actor read a memory and can take that
+  back; the revoked grant comes back with `revoked_at`. Access a buyer paid for cannot be revoked by the owner
+  (HTTP 403). Needs the service from 2026-11-25 (Memory Market revoke route, Personal Memory grant routes).
+
+### Changed
+- README: the wire-contract link is absolute, so it works on PyPI.
+
 ## 0.2.0 — 2026-11-03
 
 ### Security

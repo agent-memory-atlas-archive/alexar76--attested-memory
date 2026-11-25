@@ -50,7 +50,17 @@ class Fake(BaseHTTPRequestHandler):
             return self._reply(201, {"id": "mem_1", "title": entry["body"]["title"], "content": stored,
                                      "content_hash": content_hash(content),
                                      "truth": {"status": "unverified"}, "provenance": {"status": "attested"}})
+        if self.path == "/memory/api/memories/mem_1/grants":
+            return self._reply(200, {"id": "grant_1", "memory_id": "mem_1", "grantee_id": entry["body"]["grantee_id"],
+                                     "granted_by": "did:actor:a", "created_at": "t", "revoked_at": None})
         self._reply(404, {"detail": "not found"})
+
+    def do_DELETE(self):
+        entry = self._record()
+        if self.path == "/memory/api/memories/mem_1/grants/did%3Aactor%3Ab":
+            return self._reply(200, {"id": "grant_1", "memory_id": "mem_1", "grantee_id": "did:actor:b",
+                                     "granted_by": "did:actor:a", "created_at": "t", "revoked_at": "t2"})
+        self._reply(404, {"detail": "no grant for this grantee"})
 
     def do_GET(self):
         self._record()
@@ -131,3 +141,33 @@ def test_redirect_cannot_forward_actor_proof_or_bearer_credentials(server):
         client.read("redirect")
     assert error.value.status == 302
     assert [entry["path"] for entry in Fake.seen] == ["/memory/api/memories/redirect"]
+
+
+def test_share_and_revoke_sign_the_market_paths(server, tmp_path, monkeypatch, capsys):
+    import base64
+
+    client = Client(Actor.generate(), "ask_trial", base_url=server)
+    assert client.share("mem_1", "did:actor:b")["grantee_id"] == "did:actor:b"
+    assert client.revoke("mem_1", "did:actor:b")["revoked_at"] == "t2"
+    share, revoke = Fake.seen[-2], Fake.seen[-1]
+    assert share["body"] == {"grantee_id": "did:actor:b"}
+    assert revoke["method"] == "DELETE" and revoke["body"] is None
+
+    def signed(entry):
+        raw = entry["headers"]["x-actor-intent"]
+        intent = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+        return [(t["audience"], t["method"], t["path"]) for t in intent]
+
+    # The market's own path, ids decoded, as the market reads it after the proxy.
+    assert signed(share) == [("memory-market", "POST", "/v1/memories/mem_1/grants")]
+    assert signed(revoke) == [("memory-market", "DELETE", "/v1/memories/mem_1/grants/did:actor:b")]
+    with pytest.raises(AttestedMemoryError) as missing:
+        client.revoke("mem_1", "did:actor:nobody")
+    assert missing.value.status == 404
+
+    monkeypatch.setenv("ATTESTED_MEMORY_HOME", str(tmp_path))
+    monkeypatch.setenv("ATTESTED_MEMORY_API_KEY", "ask_trial")
+    assert main(["--url", server, "init"]) == 0
+    capsys.readouterr()
+    assert main(["--url", server, "revoke", "mem_1", "did:actor:b"]) == 0
+    assert json.loads(capsys.readouterr().out)["revoked_at"] == "t2"

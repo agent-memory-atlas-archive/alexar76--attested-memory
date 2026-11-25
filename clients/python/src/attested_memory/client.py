@@ -5,6 +5,8 @@
     client.start_trial()                      # 7-day personal key, bound to this actor
     unit = client.write("Supplier terms", "Net 30, EUR, signed 2026-09-01", tags=["finance"])
     client.read(unit["id"])                   # content checked against its content_hash
+    client.share(unit["id"], "did:actor:…")   # another actor may read it
+    client.revoke(unit["id"], "did:actor:…")  # and no longer may
 """
 
 from __future__ import annotations
@@ -94,6 +96,19 @@ class Client:
     def search(self, query: str = "", limit: int = 30) -> dict[str, Any]:
         params = urllib.parse.urlencode({"q": query, "limit": max(1, min(int(limit), 100))})
         return self._request("GET", "/memory/api/search?" + params)
+
+    # --- access --------------------------------------------------------------------------
+    def share(self, memory_id: str, grantee_id: str) -> dict[str, Any]:
+        """Let another actor (``did:actor:…``) read a memory you own. Returns the grant."""
+        path = "/memory/api/memories/" + urllib.parse.quote(memory_id, safe="") + "/grants"
+        return self._request("POST", path, {"grantee_id": grantee_id})
+
+    def revoke(self, memory_id: str, grantee_id: str) -> dict[str, Any]:
+        """Withdraw read access you gave with share(); the grant comes back with ``revoked_at``.
+        Access another actor paid for cannot be revoked by the owner (HTTP 403)."""
+        path = ("/memory/api/memories/" + urllib.parse.quote(memory_id, safe="")
+                + "/grants/" + urllib.parse.quote(grantee_id, safe=""))
+        return self._request("DELETE", path)
 
     # --- transport -----------------------------------------------------------------------
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None, *,

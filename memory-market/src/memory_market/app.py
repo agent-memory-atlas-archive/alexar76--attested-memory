@@ -19,7 +19,7 @@ import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .clients import TrustClients
+from .clients import TrustClients, commitment
 from .aimarket import BY_CAPABILITY, CAPABILITIES, register, signed_protocol_manifest
 from .config import Settings, get_settings, production_mode
 from .models import (
@@ -66,12 +66,16 @@ def provider_signer() -> ProviderSigner:
 def _attest_payment(order: PaymentOrder) -> None:
     settings = get_settings()
     unit = store().get_unchecked(order.memory_id)
+    # lineage.get@v1 is open to any hub caller, so the receipt must not name the buyer or the
+    # transaction (that linked a wallet to what it bought). It commits to both: the market, and the
+    # buyer who knows their order, transaction and actor id, can show the settlement it records.
     receipt = TrustClients(settings).attest(
-        unit, "shared", f"payment:{order.tx_hash}",
-        {"payment_order_id": order.order_id, "grantee_id": order.grantee_id, "asset": "USDC", "chain": "base"},
+        unit, "shared", "memory-market:payment",
+        {"settlement": commitment(f"{order.order_id}|{(order.tx_hash or '').lower()}|{order.grantee_id}"),
+         "asset": "USDC", "chain": "base"},
     )
     if receipt:
-        store().set_provenance(unit.id, receipt["id"], receipt["chain_root"])
+        store().set_provenance(unit.id, receipt["id"], receipt["chain_root"], created=False)
 
 
 @lru_cache
@@ -329,7 +333,7 @@ def catalog_entry(memory_id: str, actor_id: str | None = Depends(optional_actor)
         raise HTTPException(status_code=404, detail="memory not found") from None
     if unit.visibility not in {"public", "paid"} and not store().can_read(unit, actor_id, team_id):
         raise HTTPException(status_code=404, detail="memory not found")
-    return store().summary(unit)
+    return store().listing(unit, actor_id, team_id)
 
 
 @app.post("/v1/memories", response_model=MemoryUnit, status_code=201)
@@ -339,7 +343,7 @@ def create_memory(
     unit = store().create(request, actor_id)
     receipt = TrustClients(settings).attest(unit, "created", actor_id)
     if receipt:
-        store().set_provenance(unit.id, receipt["id"], receipt["chain_root"])
+        store().set_provenance(unit.id, receipt["id"], receipt["chain_root"], created=True)
     return store().get_unchecked(unit.id)
 
 
@@ -377,6 +381,18 @@ def share_memory(memory_id: str, request: GrantCreate, actor_id: str = Depends(r
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
+@app.delete("/v1/memories/{memory_id}/grants/{grantee_id:path}", response_model=Grant)
+def revoke_memory_grant(memory_id: str, grantee_id: str, actor_id: str = Depends(require_actor)) -> Grant:
+    try:
+        return store().revoke(memory_id, grantee_id, actor_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="memory not found") from None
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from None
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from None
+
+
 @app.put("/v1/memories/{memory_id}/score", response_model=ScoreResult)
 def score_memory(memory_id: str, request: ScoreCreate, actor_id: str = Depends(require_actor)) -> ScoreResult:
     try:
@@ -401,12 +417,16 @@ def verify_memory(
         raise HTTPException(status_code=503, detail="truth layer unavailable; memory remains unverified")
     store().set_truth(unit.id, result["status"], result["confidence"], result["evidence_pack_id"])
     updated = store().get_unchecked(unit.id)
+    # The pack holds the claim, which for a unit that is not public can repeat its content; the
+    # receipt (readable by anyone through lineage.get@v1) then carries a hash of the pack id.
+    pack = result["evidence_pack_id"]
     receipt = TrustClients(settings).attest(
         updated, "verified", "truth-layer",
-        {"status": result["status"], "confidence": result["confidence"], "evidence_pack_id": result["evidence_pack_id"]},
+        {"status": result["status"], "confidence": result["confidence"],
+         **({"evidence_pack_id": pack} if updated.visibility == "public" else {"evidence_pack_ref": commitment(pack)})},
     )
     if receipt:
-        store().set_provenance(unit.id, receipt["id"], receipt["chain_root"])
+        store().set_provenance(unit.id, receipt["id"], receipt["chain_root"], created=False)
     return store().get_unchecked(unit.id)
 
 
@@ -554,7 +574,7 @@ def invoke_capability(product_id: str, capability_id: str, body: dict, request: 
             # unattested for python -m memory_market.reconcile_provenance to finish.
             receipt = TrustClients(get_settings()).attest(unit, "created", actor)
             if receipt:
-                store().set_provenance(unit.id, receipt["id"], receipt["chain_root"])
+                store().set_provenance(unit.id, receipt["id"], receipt["chain_root"], created=True)
                 unit = store().get_unchecked(unit.id)
             result = unit.model_dump(mode="json")
         elif capability_id == "memory.read@v1":
@@ -568,7 +588,11 @@ def invoke_capability(product_id: str, capability_id: str, body: dict, request: 
                                            truth=_truth_filter(payload.get("truth")))
             result = {"items": [item.model_dump(mode="json") for item in items], "total": total}
         elif capability_id == "memory.share@v1":
-            grant = store().grant(str(payload.get("memory_id") or ""), str(payload.get("grantee_id") or ""), actor)
+            memory_id, grantee_id = str(payload.get("memory_id") or ""), str(payload.get("grantee_id") or "")
+            if payload.get("revoke") is True:
+                grant = store().revoke(memory_id, grantee_id, actor)
+            else:
+                grant = store().grant(memory_id, grantee_id, actor)
             result = grant.model_dump(mode="json")
         else:
             score = int(payload.get("score", 0))
@@ -578,6 +602,8 @@ def invoke_capability(product_id: str, capability_id: str, body: dict, request: 
             result = scored.model_dump(mode="json")
     except KeyError:
         raise HTTPException(status_code=404, detail="memory not found") from None
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from None
     except (ValueError, PermissionError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     for key, value in provider_signer().response_headers(capability_id, product_id, payload, result).items():

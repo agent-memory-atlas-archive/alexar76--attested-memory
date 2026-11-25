@@ -5,14 +5,14 @@
 | `memory.write@v1` | memory-market | Persists a canonical Memory Unit and requests hash-only attestation |
 | `memory.read@v1` | memory-market | Enforces visibility and explicit grants before returning content |
 | `memory.search@v1` | memory-market | Metadata and text search over records visible to the caller; leaves out memories the Truth Layer rejected unless `truth` lists the statuses wanted (or `any`) |
-| `memory.share@v1` | memory-market | Creates a revocable read grant |
+| `memory.share@v1` | memory-market | Creates a read grant; with `revoke: true` the owner withdraws it (REST: `DELETE /v1/memories/{id}/grants/{grantee}`). Access a buyer paid for cannot be revoked by the owner |
 | `memory.score@v1` | memory-market | One caller score per memory, aggregated without rewriting history |
 | `memory.verify@v1` | truth-layer | Scores supplied evidence and records the result |
 | `claim.check@v1` | truth-layer | Alias of the verification contract for standalone claims |
 | `contradiction.scan@v1` | truth-layer | Deterministic conflict indicators; not semantic proof |
-| `evidence.pack@v1` | truth-layer | Returns a portable content-addressed evidence pack |
-| `memory.attest@v1` | provenance-ledger | Adds a signed event to a memory lineage; refuses a caller the hub does not name (anonymous or trial) |
-| `lineage.get@v1` | provenance-ledger | Returns the ordered chain and its current root |
+| `evidence.pack@v1` | truth-layer | Returns a portable content-addressed evidence pack. The market shows a unit's pack id only to callers who may read the unit |
+| `memory.attest@v1` | provenance-ledger | Adds a signed event to a memory lineage; refuses a caller the hub does not name (anonymous or trial), extends only a chain the caller started, and starts no chain under a Memory Market id (`mem_…`: the market gives those their first receipt) |
+| `lineage.get@v1` | provenance-ledger | Returns the ordered chain and its current root, to any caller. Receipts of units that are not public carry hashes of their source references and evidence pack id, and a payment receipt carries a commitment to the order, transaction and buyer rather than naming them |
 | `receipt.verify@v1` | provenance-ledger | Verifies canonical payload hash, chain link and hybrid Ed25519 + ML-DSA-65 signatures, that the signing keys are the ledger's own (or listed in `PROVENANCE_TRUSTED_PUBLIC_KEYS` / `PROVENANCE_TRUSTED_PQ_PUBLIC_KEYS` after a rotation), and that the memory's newest stored receipt is the recorded chain head |
 
 Each row is registered as an independent AI Market v2 offer in the bundled Hub. Versioned direct HTTP endpoints are documented by each service at `/docs`; provider manifests are exposed at `/ai-market/v2/manifest`.

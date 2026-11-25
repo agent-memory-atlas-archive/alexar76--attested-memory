@@ -25,7 +25,7 @@ def test_memory_truth_and_provenance_share_one_object(tmp_path):
         memory_id=memory.id, event_type="created", content_hash=memory.content_hash,
         actor_id=memory.owner_id, source_refs=memory.source_refs,
     ))
-    market.set_provenance(memory.id, created_receipt.id, created_receipt.chain_root)
+    market.set_provenance(memory.id, created_receipt.id, created_receipt.chain_root, created=True)
 
     excerpt_hash = "sha256:" + hashlib.sha256(b"restore test passed").hexdigest()
     pack = verify(VerifyRequest(
@@ -41,7 +41,7 @@ def test_memory_truth_and_provenance_share_one_object(tmp_path):
         memory_id=memory.id, event_type="verified", content_hash=memory.content_hash,
         actor_id="truth-layer", metadata={"evidence_pack_id": pack.id, "status": pack.result.status},
     ))
-    market.set_provenance(memory.id, verified_receipt.id, verified_receipt.chain_root)
+    market.set_provenance(memory.id, verified_receipt.id, verified_receipt.chain_root, created=False)
 
     final = market.get_unchecked(memory.id)
     assert final.truth.status == "supported"

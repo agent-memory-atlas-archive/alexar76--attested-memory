@@ -1,10 +1,11 @@
+import pytest
 import hashlib
 import contextvars
 from types import SimpleNamespace
 
 from provenance_ledger.crypto import Signer
 from provenance_ledger.models import AttestationCreate
-from provenance_ledger.store import Ledger
+from provenance_ledger.store import ChainHeadMissing, Ledger
 from provenance_ledger.db import Database
 from fastapi import Response
 import provenance_ledger.app as app_module
@@ -33,7 +34,14 @@ def test_append_chain_and_verify(tmp_path):
     assert head["chain_root"] == second.chain_root
 
 
-def test_migration_backfills_chain_head(tmp_path):
+def _pre_head_database(ledger):
+    """Turn a ledger database into one from before receipt_heads existed."""
+    with ledger.connection:
+        ledger.connection.execute("DELETE FROM receipt_heads")
+        ledger.connection.execute("DELETE FROM ledger_meta")
+
+
+def test_migration_backfills_chain_head_once(tmp_path):
     db_path = str(tmp_path / "ledger.sqlite3")
     key_path = str(tmp_path / "key.pem")
     ledger = Ledger(db_path, Signer(key_path))
@@ -41,8 +49,7 @@ def test_migration_backfills_chain_head(tmp_path):
         memory_id="mem_1234567890abcdef12345678", event_type="created",
         content_hash="sha256:" + "c" * 64, actor_id="agent:test",
     ))
-    with ledger.connection:
-        ledger.connection.execute("DELETE FROM receipt_heads")
+    _pre_head_database(ledger)
     ledger.connection.close()
 
     reopened = Ledger(db_path, Signer(key_path))
@@ -50,6 +57,32 @@ def test_migration_backfills_chain_head(tmp_path):
         "SELECT chain_root FROM receipt_heads WHERE memory_id = ?", (receipt.memory_id,)
     ).fetchone()
     assert row["chain_root"] == receipt.chain_root
+    assert reopened.verify(receipt.id).valid is True
+
+
+def test_a_deleted_head_is_not_rebuilt_and_the_chain_is_not_extended(tmp_path, monkeypatch):
+    """Atlas re-read 2026-11-25: the backfill ran at every start, so deleting receipts and then the
+    head row was healed from the receipts that were left, and verify passed again."""
+    monkeypatch.delenv("ATTESTED_PQC_ENABLED", raising=False)
+    db_path, key_path = str(tmp_path / "ledger.sqlite3"), str(tmp_path / "key.pem")
+    ledger = Ledger(db_path, Signer(key_path))
+    memory_id = "mem_1234567890abcdef12345678"
+    first = ledger.append(AttestationCreate(
+        memory_id=memory_id, event_type="created", content_hash="sha256:" + "f" * 64, actor_id="agent:test"))
+    second = ledger.append(AttestationCreate(
+        memory_id=memory_id, event_type="verified", content_hash="sha256:" + "f" * 64, actor_id="truth-layer"))
+    with ledger.connection:
+        ledger.connection.execute("DELETE FROM receipts WHERE id = ?", (second.id,))
+        ledger.connection.execute("DELETE FROM receipt_heads WHERE memory_id = ?", (memory_id,))
+    ledger.connection.close()
+
+    reopened = Ledger(db_path, Signer(key_path))
+    result = reopened.verify(first.id)
+    assert result.checks["chain_head"] is False and result.valid is False
+    with pytest.raises(ChainHeadMissing):
+        reopened.append(AttestationCreate(
+            memory_id=memory_id, event_type="updated", content_hash="sha256:" + "f" * 64, actor_id="agent:test"))
+    assert [r.id for r in reopened.lineage(memory_id).receipts] == [first.id]
 
 
 def test_tamper_is_detected(tmp_path):
@@ -210,14 +243,14 @@ def test_hub_attest_refuses_an_anonymous_caller_but_reads_stay_open(tmp_path, mo
     test_ledger = Ledger(str(tmp_path / "ledger.sqlite3"), Signer(str(tmp_path / "key.pem")))
     monkeypatch.setattr(app_module, "ledger", lambda: test_ledger)
     client = TestClient(app_module.app)
-    body = {"input": {"memory_id": "mem_1234567890abcdef12345678", "event_type": "created",
+    body = {"input": {"memory_id": "note-1234567890", "event_type": "created",
                       "content_hash": "sha256:" + "9" * 64}}
     product = app_module.BY_CAPABILITY["memory.attest@v1"].product_id
     url = f"/capabilities/{product}/memory.attest@v1/invoke"
 
     refused = client.post(url, json=body)
     assert refused.status_code == 403
-    assert test_ledger.lineage("mem_1234567890abcdef12345678").receipts == []
+    assert test_ledger.lineage("note-1234567890").receipts == []
 
     named = client.post(url, json=body, headers={"X-AIMarket-Buyer-Ref": "bref-" + "a" * 32})
     assert named.status_code == 200, named.text
@@ -226,5 +259,39 @@ def test_hub_attest_refuses_an_anonymous_caller_but_reads_stay_open(tmp_path, mo
 
     product_l = app_module.BY_CAPABILITY["lineage.get@v1"].product_id
     lineage = client.post(f"/capabilities/{product_l}/lineage.get@v1/invoke",
-                          json={"input": {"memory_id": "mem_1234567890abcdef12345678"}})
+                          json={"input": {"memory_id": "note-1234567890"}})
     assert lineage.status_code == 200 and len(lineage.json()["result"]["receipts"]) == 1
+
+
+def test_hub_buyers_extend_only_their_own_chains(tmp_path, monkeypatch):
+    """Atlas re-read 2026-11-25: any named buyer could append any event with any hash to any memory
+    id, including a `created` receipt on another owner's Memory Market unit."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("ATTESTED_PQC_ENABLED", raising=False)
+    test_ledger = Ledger(str(tmp_path / "ledger.sqlite3"), Signer(str(tmp_path / "key.pem")))
+    monkeypatch.setattr(app_module, "ledger", lambda: test_ledger)
+    client = TestClient(app_module.app)
+    url = f"/capabilities/{app_module.BY_CAPABILITY['memory.attest@v1'].product_id}/memory.attest@v1/invoke"
+    alice, bob = "bref-" + "a" * 32, "bref-" + "b" * 32
+
+    def attest(memory_id, buyer, event="updated"):
+        return client.post(url, headers={"X-AIMarket-Buyer-Ref": buyer}, json={"input": {
+            "memory_id": memory_id, "event_type": event, "content_hash": "sha256:" + "9" * 64}})
+
+    # Outside the market's ids, the first buyer starts the chain and only they extend it.
+    assert attest("note-alice-1", alice, "created").status_code == 200
+    assert attest("note-alice-1", alice).status_code == 200
+    refused = attest("note-alice-1", bob, "created")
+    assert refused.status_code == 403 and "another actor" in refused.json()["detail"]
+
+    # A Memory Market id: nobody starts it through the hub, not even its future owner.
+    market_id = "mem_" + "1" * 24
+    assert attest(market_id, alice, "created").status_code == 403
+    assert test_ledger.lineage(market_id).receipts == []
+    # The market starts it (operator route) in the owner's name; then the owner may extend, others not.
+    test_ledger.append(AttestationCreate(memory_id=market_id, event_type="created",
+                                         content_hash="sha256:" + "9" * 64, actor_id="aimarket:" + alice))
+    assert attest(market_id, alice).status_code == 200
+    assert attest(market_id, bob, "created").status_code == 403
+    assert [r.actor_id for r in test_ledger.lineage(market_id).receipts] == ["aimarket:" + alice] * 2

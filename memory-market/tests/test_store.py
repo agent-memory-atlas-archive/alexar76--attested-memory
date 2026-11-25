@@ -40,7 +40,7 @@ def test_truth_and_provenance_are_properties_of_memory(tmp_path):
     store = make_store(tmp_path)
     unit = store.create(MemoryCreate(title="Finding", content="Evidence-backed finding"), "researcher")
     store.set_truth(unit.id, "supported", 0.92, "pack_test")
-    store.set_provenance(unit.id, "rcpt_test", "sha256:" + "b" * 64)
+    store.set_provenance(unit.id, "rcpt_test", "sha256:" + "b" * 64, created=True)
     updated = store.get_unchecked(unit.id)
     assert updated.truth.status == "supported"
     assert updated.provenance.status == "attested"

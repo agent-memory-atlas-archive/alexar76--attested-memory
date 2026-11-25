@@ -368,7 +368,16 @@ class MemoryStore:
             f"SELECT * FROM memories WHERE {access}{search} ORDER BY created_at DESC LIMIT ? OFFSET ?",
             [*params, limit, offset],
         ).fetchall()
-        return [self.summary(self._unit(row)) for row in rows], count
+        return [self.listing(self._unit(row), actor_id, team_id) for row in rows], count
+
+    def listing(self, unit: MemoryUnit, actor_id: str | None, team_id: str | None = None) -> MemorySummary:
+        """A catalogue entry for this caller. The evidence pack holds the verified claim, which for a
+        paid or private unit can repeat its content, so only a caller who may read the unit gets the
+        pack id; everyone sees the truth status and confidence."""
+        summary = self.summary(unit)
+        if summary.truth.evidence_pack_id and not self.can_read(unit, actor_id, team_id):
+            summary = summary.model_copy(update={"truth": summary.truth.model_copy(update={"evidence_pack_id": None})})
+        return summary
 
     def grant(self, memory_id: str, grantee_id: str, actor_id: str) -> Grant:
         unit = self.get_unchecked(memory_id)
@@ -389,6 +398,32 @@ class MemoryStore:
         ).fetchone()
         return Grant(**dict(row))
 
+    def revoke(self, memory_id: str, grantee_id: str, actor_id: str) -> Grant:
+        """The owner withdraws access they gave. Access a buyer paid for is not the owner's to take
+        back (a reorged payment removes its own grant, see reorg_payment)."""
+        unit = self.get_unchecked(memory_id)
+        if unit.owner_id != actor_id:
+            raise PermissionError("only the owner can revoke access")
+        with self.lock, self.connection:
+            row = self.connection.execute(
+                "SELECT id, memory_id, grantee_id, granted_by, created_at, revoked_at FROM grants "
+                "WHERE memory_id = ? AND grantee_id = ?", (memory_id, grantee_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError("no grant for this grantee")
+            if self.connection.execute(
+                "SELECT 1 FROM payment_orders WHERE grant_id = ? AND state = 'confirmed'", (row["id"],)
+            ).fetchone() is not None:
+                raise PermissionError("this access was paid for; the owner cannot revoke it")
+            if row["revoked_at"] is None:
+                self.connection.execute(
+                    "UPDATE grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (now(), row["id"]))
+        row = self.connection.execute(
+            "SELECT id, memory_id, grantee_id, granted_by, created_at, revoked_at FROM grants WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        return Grant(**dict(row))
+
     def score(self, memory_id: str, actor_id: str, score: int) -> ScoreResult:
         self.get_unchecked(memory_id)
         timestamp = now()
@@ -402,17 +437,29 @@ class MemoryStore:
         average, count = self._rating(memory_id)
         return ScoreResult(memory_id=memory_id, average_score=average or 0, score_count=count)
 
-    def set_provenance(self, memory_id: str, receipt_id: str, lineage_root: str) -> None:
+    def set_provenance(self, memory_id: str, receipt_id: str, lineage_root: str, *, created: bool) -> None:
+        """Record the newest ledger receipt of a unit. Only its ``created`` receipt makes the unit
+        ``attested``: a payment or verification receipt that lands while the creation receipt is
+        still missing keeps it ``unattested``, so reconcile_provenance still adds the creation."""
         with self.connection:
             self.connection.execute(
-                "UPDATE memories SET provenance_status='attested', receipt_id=?, lineage_root=?, updated_at=? WHERE id=?",
-                (receipt_id, lineage_root, now(), memory_id),
+                "UPDATE memories SET provenance_status=CASE WHEN ? THEN 'attested' ELSE provenance_status END, "
+                "receipt_id=?, lineage_root=?, updated_at=? WHERE id=?",
+                (bool(created), receipt_id, lineage_root, now(), memory_id),
             )
 
     def unattested(self, limit: int = 200, after_id: str = "") -> list[MemoryUnit]:
         """Units the ledger never confirmed (``provenance_status='unattested'``), oldest id first."""
         rows = self.connection.execute(
             "SELECT * FROM memories WHERE provenance_status='unattested' AND id > ? ORDER BY id LIMIT ?",
+            (after_id, limit),
+        ).fetchall()
+        return [self._unit(row) for row in rows]
+
+    def attested(self, limit: int = 200, after_id: str = "") -> list[MemoryUnit]:
+        """Units with a ledger receipt recorded here, oldest id first."""
+        rows = self.connection.execute(
+            "SELECT * FROM memories WHERE provenance_status='attested' AND id > ? ORDER BY id LIMIT ?",
             (after_id, limit),
         ).fetchall()
         return [self._unit(row) for row in rows]

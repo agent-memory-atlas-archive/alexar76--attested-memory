@@ -14,7 +14,7 @@ from .aimarket import BY_CAPABILITY, CAPABILITIES, register, signed_protocol_man
 from .config import Settings, get_settings
 from .crypto import Signer
 from .models import AttestationCreate, Lineage, Receipt, VerifyRequest, VerifyResult
-from .store import Ledger
+from .store import ChainHeadMissing, HubAppendRefused, Ledger
 
 
 def production_mode() -> bool:
@@ -93,7 +93,10 @@ def health(response: Response) -> dict:
 
 @app.post("/v1/attestations", response_model=Receipt, dependencies=[Depends(require_admin)])
 def create_attestation(request: AttestationCreate) -> Receipt:
-    return ledger().append(request)
+    try:
+        return ledger().append(request)
+    except ChainHeadMissing:
+        raise HTTPException(status_code=409, detail=_HEAD_MISSING) from None
 
 
 @app.get("/v1/receipts/{receipt_id}", response_model=Receipt, dependencies=[Depends(require_admin)])
@@ -161,6 +164,7 @@ _NEEDS_BUYER = (
 )
 
 
+_HEAD_MISSING = "this memory has receipts but no recorded chain head; the ledger will not extend it"
 def _aimarket_actor(request: Request) -> str:
     """Who an attestation made through the hub is recorded under.
 
@@ -191,13 +195,19 @@ def invoke_capability(
             if actor == "aimarket:anonymous":
                 raise HTTPException(status_code=403, detail=_NEEDS_BUYER)
             attestation = AttestationCreate.model_validate({**payload, "actor_id": actor})
-            result = ledger().append(attestation).model_dump(mode="json")
+            # A hub buyer extends only a chain they started, and starts none under a Memory Market
+            # id (Ledger.append, checked under the append lock).
+            result = ledger().append(attestation, hub_caller=True).model_dump(mode="json")
         elif capability_id == "lineage.get@v1":
             result = ledger().lineage(str(payload.get("memory_id") or "")).model_dump(mode="json")
         else:
             result = ledger().verify(str(payload.get("receipt_id") or "")).model_dump(mode="json")
     except KeyError:
         raise HTTPException(status_code=404, detail="receipt not found") from None
+    except ChainHeadMissing:
+        raise HTTPException(status_code=409, detail=_HEAD_MISSING) from None
+    except HubAppendRefused as refusal:
+        raise HTTPException(status_code=403, detail=str(refusal)) from None
     except ValidationError as error:
         raise HTTPException(status_code=422, detail=error.errors()) from None
 

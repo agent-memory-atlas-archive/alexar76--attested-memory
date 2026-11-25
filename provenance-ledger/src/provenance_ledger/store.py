@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -13,6 +14,20 @@ from .models import AttestationCreate, Lineage, Receipt, VerifyResult
 from .db import Database
 
 GENESIS_ROOT = "sha256:" + "0" * 64
+
+
+class ChainHeadMissing(RuntimeError):
+    """A memory has receipts but no recorded chain head; the ledger refuses to extend it."""
+
+
+class HubAppendRefused(PermissionError):
+    """A hub buyer asked to append where they may not (see Ledger.append, hub_caller)."""
+
+
+# Memory Market names its units mem_<24 hex> and starts their chains itself, through the operator
+# route with the unit's owner as actor. Through the hub a buyer could otherwise open such a chain
+# first, or add a `created` receipt to someone else's unit for the market's reconcile to pick up.
+MARKET_MEMORY_ID = re.compile(r"mem_[0-9a-f]{24}")
 
 
 def canonical_json(value: object) -> str:
@@ -63,6 +78,10 @@ class Ledger:
                     memory_id TEXT PRIMARY KEY,
                     chain_root TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ledger_meta (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             if self.connection.is_postgres:
@@ -88,6 +107,14 @@ class Ledger:
                     "SELECT setval('receipts_sequence_seq', COALESCE(MAX(sequence), 1), "
                     "COUNT(*) > 0) FROM receipts"
                 )
+            # receipt_heads arrived after receipts did, so a database from before it gets its heads
+            # from its receipts ONCE. Rebuilding them at every start (as before) quietly restored a
+            # deleted head from whatever receipts were left, which undid the chain_head check.
+            done = self.connection.execute(
+                "SELECT value FROM ledger_meta WHERE name = 'heads_backfilled'"
+            ).fetchone()
+            if done is not None:
+                return
             self.connection.execute(
                 """INSERT INTO receipt_heads(memory_id, chain_root)
                 SELECT receipt.memory_id, receipt.chain_root
@@ -98,14 +125,44 @@ class Ledger:
                 )
                 ON CONFLICT(memory_id) DO NOTHING"""
             )
+            self.connection.execute(
+                "INSERT INTO ledger_meta(name, value) VALUES ('heads_backfilled', ?) "
+                "ON CONFLICT(name) DO NOTHING",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
 
-    def append(self, request: AttestationCreate) -> Receipt:
+    def append(self, request: AttestationCreate, *, hub_caller: bool = False) -> Receipt:
+        """Add one receipt to the memory's chain. ``hub_caller`` marks a buyer's call through the
+        hub: they may extend only a chain whose first receipt is theirs, and may not start a chain
+        under a Memory Market id."""
         with self.lock, self.connection:
+            head = self.connection.execute(
+                "SELECT chain_root FROM receipt_heads WHERE memory_id = ?", (request.memory_id,)
+            ).fetchone()
+            if head is None and self.connection.execute(
+                "SELECT 1 FROM receipts WHERE memory_id = ? LIMIT 1", (request.memory_id,)
+            ).fetchone() is not None:
+                # Receipts without a head: the head row was deleted. Starting again from genesis
+                # would graft a fresh chain onto a damaged one and hide the damage.
+                raise ChainHeadMissing(request.memory_id)
             self.connection.execute(
                 "INSERT INTO receipt_heads(memory_id, chain_root) VALUES (?, ?) "
                 "ON CONFLICT(memory_id) DO NOTHING",
                 (request.memory_id, GENESIS_ROOT),
             )
+            lock = " FOR UPDATE" if self.connection.is_postgres else ""
+            if hub_caller:
+                # Lock the head row first so two buyers cannot both start the same chain.
+                self.connection.execute(
+                    "SELECT chain_root FROM receipt_heads WHERE memory_id = ?" + lock, (request.memory_id,)
+                ).fetchone()
+                starter = self.chain_starter(request.memory_id)
+                if starter is None and MARKET_MEMORY_ID.fullmatch(request.memory_id):
+                    raise HubAppendRefused(
+                        "Memory Market units get their first receipt from the market, not through the hub")
+                if starter is not None and starter != request.actor_id:
+                    raise HubAppendRefused(
+                        "this memory's chain was started by another actor; only that actor appends through the hub")
             lock = " FOR UPDATE" if self.connection.is_postgres else ""
             previous = self.connection.execute(
                 "SELECT chain_root FROM receipt_heads WHERE memory_id = ?" + lock,
@@ -188,6 +245,13 @@ class Ledger:
         receipts = [self._receipt(row) for row in rows]
         return Lineage(memory_id=memory_id, chain_root=receipts[-1].chain_root if receipts else None, receipts=receipts)
 
+    def chain_starter(self, memory_id: str) -> str | None:
+        """The actor of a memory's first receipt, or None for a memory with no receipts."""
+        row = self.connection.execute(
+            "SELECT actor_id FROM receipts WHERE memory_id = ? ORDER BY sequence LIMIT 1", (memory_id,)
+        ).fetchone()
+        return row["actor_id"] if row else None
+
     def trusted_public_keys(self) -> set[str]:
         """The ledger's Ed25519 key, plus earlier keys listed in PROVENANCE_TRUSTED_PUBLIC_KEYS
         (comma-separated, as receipts carry them) so receipts signed before a key rotation verify."""
@@ -234,9 +298,11 @@ class Ledger:
             receipt.pq_public_key is None or receipt.pq_public_key in self.trusted_pq_public_keys()
         )
         # The newest stored receipt of the memory must be the chain head the ledger recorded, so
-        # deleting the latest receipts of a chain is not invisible. Both live in this database, so
-        # this catches lost or deleted rows, not an attacker who also rewrites receipt_heads; for
-        # that, compare with a chain_root kept outside the ledger (the one returned on append).
+        # deleting the latest receipts of a chain is not invisible, and a deleted head row stays
+        # missing (it is not rebuilt at start). Both live in this database, so this catches lost or
+        # deleted rows, not an attacker who also rewrites receipt_heads; for that, compare with a
+        # chain_root kept outside the ledger: Memory Market keeps each unit's root and
+        # `python -m memory_market.reconcile_provenance --check` looks for it in the chain.
         head = self.connection.execute(
             "SELECT chain_root FROM receipt_heads WHERE memory_id = ?", (receipt.memory_id,)
         ).fetchone()

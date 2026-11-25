@@ -12,6 +12,8 @@ attested-memory trial                     # 7-day personal key, bound to that ac
 attested-memory write "Supplier terms" "Net 30, EUR, signed 2026-09-01" --tag finance --source contract-17
 attested-memory search supplier
 attested-memory read mem_…
+attested-memory share mem_… did:actor:…   # another actor may read it
+attested-memory revoke mem_… did:actor:…  # and no longer may
 ```
 
 ```python
@@ -22,6 +24,8 @@ client = Client(actor)
 client.start_trial()                  # or Client(actor, api_key="ask_…")
 unit = client.write("Supplier terms", "Net 30", tags=["finance"])
 client.read(unit["id"])               # raises IntegrityError if the text does not match its hash
+client.share(unit["id"], "did:actor:…")
+client.revoke(unit["id"], "did:actor:…")   # access a buyer paid for cannot be revoked (HTTP 403)
 ```
 
 What is checked where:
@@ -38,7 +42,7 @@ different request. Nonces are persisted by the service, including across worker
 restarts. `Client` handles these targets automatically; direct callers must pass
 `audience`, `method`, `path` and the exact `body` bytes to `Actor.proof_headers`.
 Legacy identity-only proofs are refused. See the
-[wire contract](../../docs/actor-request-proofs-v2.md).
+[wire contract](https://github.com/alexar76/attested-memory/blob/main/docs/actor-request-proofs-v2.md).
 
 Environment for the CLI: `ATTESTED_MEMORY_HOME`, `ATTESTED_MEMORY_URL`, `ATTESTED_MEMORY_API_KEY`.
 

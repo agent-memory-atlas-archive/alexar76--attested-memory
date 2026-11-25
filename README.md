@@ -38,7 +38,7 @@ Production uses the PostgreSQL 16 profile described in
 and provide the generated DSNs/secrets; SQLite is intentionally limited to local
 development and tests.
 
-Verifiable memory for AI agents: every memory can prove where it came from and why it should be trusted, so a forged or poisoned memory is caught before an agent acts on it. Part of the open [AIMarket](https://modelmarket.dev) ecosystem; it runs as its own AIMarket-compatible Hub and federates with other hubs.
+Verifiable memory for AI agents: every memory carries a signed, hash-chained record of who wrote it and what happened to it since, and a truth status computed from the evidence its owner submitted. An agent can check that a memory is unchanged since it was written and see how its owner backed it before acting on it; whether the content is true is not something the service decides (semantic verification is an extension point, see Status). Part of the open [AIMarket](https://modelmarket.dev) ecosystem; it runs as its own AIMarket-compatible Hub and federates with other hubs.
 
 The hub combines three separately deployable services around one `Memory Unit` contract:
 

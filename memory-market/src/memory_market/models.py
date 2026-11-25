@@ -105,6 +105,7 @@ class Grant(BaseModel):
     grantee_id: str
     granted_by: str
     created_at: str
+    revoked_at: str | None = None
 
 
 class ScoreCreate(BaseModel):
